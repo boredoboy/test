@@ -1,0 +1,132 @@
+name: Android Build
+
+# Builds an installable APK from the Godot 4 project on every push to main.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GODOT_VERSION: "4.7.2"
+  APK_NAME: neon-endless-runner.apk
+
+jobs:
+  build-apk:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: "platform-tools"
+
+      - name: Resolve Android SDK location
+        run: |
+          # sdkmanager's location tells us which SDK root is on PATH — that is
+          # where all packages (and therefore Godot) must look for them.
+          SM="$(command -v sdkmanager)"
+          SM_REAL="$(realpath "${SM}")"
+          echo "sdkmanager: ${SM} -> ${SM_REAL}"
+          SDK_PATH="$(cd "$(dirname "${SM_REAL}")/../../.." && pwd)"
+          if [ ! -d "${SDK_PATH}/cmdline-tools" ]; then
+            SDK_PATH="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          fi
+          if [ -z "${SDK_PATH}" ] || [ ! -d "${SDK_PATH}" ]; then
+            echo "::error::Unable to resolve the Android SDK path"
+            exit 1
+          fi
+          echo "Android SDK path: ${SDK_PATH}"
+          echo "ANDROID_HOME=${SDK_PATH}" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=${SDK_PATH}" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_PATH=${SDK_PATH}" >> "$GITHUB_ENV"
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager --sdk_root="${ANDROID_SDK_PATH}" --install \
+            "platform-tools" "platforms;android-35" "build-tools;35.0.1"
+          sdkmanager --sdk_root="${ANDROID_SDK_PATH}" --list_installed
+
+      - name: Setup Godot
+        uses: chickensoft-games/setup-godot@v2
+        with:
+          version: ${{ env.GODOT_VERSION }}
+          use-dotnet: false
+          include-templates: true
+
+      - name: Verify Godot installation
+        run: |
+          command -v godot
+          godot --version
+          ls -la "${HOME}/.local/share/godot/export_templates/"
+
+      - name: Generate debug keystore
+        run: |
+          mkdir -p "${HOME}/.android"
+          keytool -genkeypair \
+            -keystore "${HOME}/.android/debug.keystore" \
+            -storepass android -keypass android \
+            -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+          keytool -list -keystore "${HOME}/.android/debug.keystore" \
+            -storepass android -alias androiddebugkey | head -n 5
+
+      - name: Configure Godot editor settings
+        run: |
+          mkdir -p "${HOME}/.config/godot"
+          cat > "${HOME}/.config/godot/editor_settings-4.tres" <<EOF
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/android_sdk_path = "${ANDROID_SDK_PATH}"
+          export/android/java_sdk_path = "${JAVA_HOME}"
+          export/android/debug_keystore = "${HOME}/.android/debug.keystore"
+          export/android/debug_keystore_user = "androiddebugkey"
+          export/android/debug_keystore_password = "android"
+          EOF
+          echo "--- editor_settings-4.tres ---"
+          cat "${HOME}/.config/godot/editor_settings-4.tres"
+
+      - name: Import project resources
+        run: |
+          godot --headless --import || godot --headless --editor --quit
+
+      - name: Smoke test (headless)
+        run: godot --headless --quit-after 60
+
+      - name: Export APK
+        env:
+          GODOT_ANDROID_KEYSTORE_DEBUG_PATH: /home/runner/.android/debug.keystore
+          GODOT_ANDROID_KEYSTORE_DEBUG_USER: androiddebugkey
+          GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD: android
+        run: |
+          mkdir -p build
+          godot --headless --export-debug "Android" "build/${APK_NAME}"
+          ls -lh build/
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NeonEndlessRunner-APK
+          path: build/*.apk
+          if-no-files-found: error
+          retention-days: 30
